@@ -1,0 +1,415 @@
+---
+title: "STV 2022 semesteroppgave markdown"
+author: "Kandidat 17114"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+  word_document: default
+---
+```{r setup, include=TRUE}
+#Laster inn pakker jeg bruker i oppgaven
+library(tidymodels)
+library(tidytext)
+library(stringr)
+library(textrecipes)
+library(rainette)
+library(quanteda)
+library(tm)
+library(glmnet)
+library(xlsx)
+library(stortingscrape)
+library(tidyverse)
+library(ggdark)
+library(quanteda.textplots)
+library(ggthemes)
+library(ggwordcloud)
+library(readxl)
+library(NorSentLex)
+library(textdata)
+library(dplyr)
+library(lubridate)
+
+
+#Setter Seed slik at prediksjonene blir like hver gang
+set.seed(3333)
+# Lager først en boxplot over strømprisene hentet fra SSB
+
+#Strømpriser_2021_2022 <- read_excel("Documents/STV - 2022/Strømpriser 2021-2022.xlsx")
+Strømpriser_2021_2022 <- read_excel("~/Desktop/Strømpriser 2021-2022.xlsx")
+
+view(Strømpriser_2021_2022)
+Pris <- Strømpriser_2021_2022
+
+#Plot som viser strømprisene 
+ggplot(data = Pris) +
+  geom_path(aes(x = kvartal, y = Pris,group = 1, color = "red")) +
+  theme_bw() +
+  labs(y = "Kvartal",
+       x = "Strømpris pris kroner")
+```
+
+
+```{r, include=TRUE}
+#Henter Skriftilige spørsmål fra Stortinget 
+
+wq2022 <- get_session_questions("2021-2022", 
+                                q_type = "skriftligesporsmal", 
+                                good_manners = 2)
+
+#Fjerner metadata slik at jeg kun har Spørsmål og ID
+stor <- wq2022 %>% 
+  select(-response_date, -version,-answ_by_id, -answ_by_minister_id, -answ_by_minister_title,-answ_date,-answ_on_belhalf_of,-answ_on_belhalf_of_minister_id,-answ_on_belhalf_of_minister_title, -sendt_date,-topic_ids,-moved_to,-asked_by_other_id,-correct_person,-correct_person_minister_id,-correct_person_minister_title,-session_id,-question_from_id,-qustion_number,-qustion_to_id,-qustion_to_minister_id,-qustion_to_minister_title,-topic_ids,-status,-type)
+
+#Gjør filen "stor" om til et excel dokuement slik at jeg kan håndkode spørsmålene for å forbrede veiledet læring
+
+#write.xlsx(stor, file = "myworkbook.xlsx",
+  #         sheetName = "Stor", append = FALSE)
+
+#bruker excel filen til å markere hvlike som er relevante 
+#legger til veildet læringsdata settet og kaller den Veiledet_Læring3 
+
+#Den håndkodede filen heter "Veiledet læring3, dette får man ikke tilgang på gjennom inspera
+Veiledet_læring3 <- read_excel("~/Documents/STV - 2022/Veiledet læring3.xlsx")
+
+#tokeniserer spørsmålene
+
+Stor_tokens1 <- Veiledet_læring3 %>% 
+  unnest_tokens(output = token,
+                input = title) 
+
+
+
+#viser de to mest brukte ordene utenstoppordsliste 
+Stor_tokens1 %>% 
+  count(token) %>% 
+  slice_max(order_by = n,
+            n = 10,
+            with_ties = FALSE)
+#Legger til stoppordsliste fra quanteda og viser de 10 mest brukte ordene 
+Stor_tokens1 %>% 
+  count(token) %>% 
+  filter(!(token %in% quanteda::stopwords("no"))) %>% 
+  slice_max(order_by = n,
+            n = 10,
+            with_ties = FALSE)
+
+#lager egen stoppordsliste 
+
+Stor_stop <- Stor_tokens1 %>% 
+  add_count(token) %>% 
+  bind_tf_idf(token, id, n ) %>% 
+  ungroup() %>% 
+  select(token,idf) %>% 
+  unique() %>% 
+  arrange(idf)
+
+Stor_stop2 <- Stor_stop %>% 
+  filter(idf < 1.1)
+#Viser topp ord med egen stoppordliste 
+Stor_tokens1 %>%
+  filter(token %in% Stor_stop2$token == FALSE) %>% 
+  count(token) %>% 
+  slice_max(order_by = n,
+            n = 10,
+            with_ties = FALSE)
+
+#egen stoppordsliste fungerer ikke veldig godt. Dette er blant annet fordi mange spørsmål er formulert likt og noen er formulert ulikt 
+#Bruker dermed quanteda sin stoppordliste fremover i analysen.
+
+
+```
+
+
+```{r, include=TRUE}
+#lager et nyttdatasett uten NA
+Veiledet_læringNA <- na.omit(Veiledet_læring3)
+
+#Fjerner nummer og ID slik at jeg kun har tittel og tema for å teste prediksjonen 
+Stor_vei <- Veiledet_læringNA %>% 
+  select(-Number, -id)
+
+Vei_splitt <- initial_split(Stor_vei, #  Deler datasettet i to
+                            prop = 0.8, # 80 prosent av data (dvs. 80 prosen av radene/spørsmålene) skal gå inn i treningsdata, resten blir testdata
+                            strata = tema) # Passer på at Y, tema, er godt representert i både treningsdatasett og testdatasett
+
+Stor_trening <- training(Vei_splitt) # Lager treningsdatasett
+Stor_test <- testing(Vei_splitt) # Lager testdatasett
+
+Stor_trening %>% head()
+
+
+Stor_folds <- vfold_cv(Stor_trening, # Splitt treningsdatasettet inn i valideringsdatasett 
+                       strata = tema, # Passer på at Y, tema, er godt representert i både valideringsdatasett og treningsdatasett
+                       v = 5)
+
+Stor_oppskrift <- recipe(tema ~ ., data = Stor_trening) %>% # Modellen jeg ønsker å kjøre - jeg vil estimere Y ved å bruke resten av dataene
+  step_mutate(title = str_to_lower(title)) %>% # Setter alle til liten bokstav
+  step_mutate(title = removeNumbers(title)) %>%  # Fjerner tall
+  step_mutate(title = removePunctuation(title)) %>% # Fjerner punktsetting
+  step_tokenize(title) %>% # Tokeniserer teksten
+  step_stem(title) %>% # Lager ordstammer
+  step_stopwords(title, custom_stopword_source = stopwords("no")) %>% # Fjerner stoppord
+  step_tokenfilter(title, max_tokens = 400, min_times = 2) %>% # Beholder tokens som dukker opp maks 1000 ganger, fjerner de som dukker opp mindre enn 2 ganger
+  step_tfidf(title) # Vektoriserer teksten med TF-IDF
+
+
+prep(Stor_oppskrift) %>% # Iverksetter preprosesseringsstegene slik beskrevet i oppskriften over
+  bake(new_data = NULL) %>% # Ser på hvordan oppskrifts-objektet ser ut
+  head(5) %>% select(1:5) 
+
+
+contrl_preds <- control_resamples(save_pred = TRUE)
+
+
+glmn_spec <- 
+  logistic_reg(penalty = 0.001, # Setter et par argumenter for å forhinde modeller fra å overtilpasse seg
+               mixture = 0.5) %>% 
+  set_engine("glmnet") %>% # Logistisk modell får vi ved å spesifisere "glmnet"
+  set_mode("classification")
+
+glm_wf <- workflow(Stor_oppskrift, # Datasettet etter preprosessering
+                   glmn_spec) # Modellen som spesifisert over, altså logitisk
+
+glm_rs <- fit_resamples( # Passer modellen ved å bruke testdata og valideringsdata i sekvens fem ganger
+  glm_wf, # Dette objektet forteller hva som er data og hva som er modellen
+  resamples = Stor_folds, # Spesifiserer hva valideringsdataene er
+  control = contrl_preds # Legger valgene som jeg lagret over
+)
+
+show_notes(.Last.tune.result)
+
+
+final_fittweets <- last_fit(glm_wf, Vei_splitt) # Passer SVM-modellen til testdatasettet
+
+collect_metrics(final_fittweets)
+
+
+metrikk_glm <- collect_predictions(final_fittweets)
+
+#Visualisering av "treffsikkerheten" til treningsdataene. 
+metrikk_glm %>%
+  conf_mat(truth = tema, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+
+glm_wf_to <-fit(glm_wf,data = Stor_trening)
+
+Eu_Predic <- predict(glm_wf_to,new_data = Veiledet_læring3)
+
+#Binder radene slik at jeg får den prediksjonen på en kollone 
+prediksjon_stor <- bind_cols(Veiledet_læring3,Eu_Predic)
+
+
+#Henter inn stortingssdataene og kobler stortingsdataene med prediksjonen slik at hvert spørsmål også har med prediksjonen
+prediksjon_stor <- bind_cols(wq2022,Eu_Predic)
+
+#Eu_pred <- prediksjon_stor %>% 
+ # filter(str_detect(.pred_class,"Eu") == TRUE)
+
+#den funker ikke fordi variabelen ".pred_class" starter med punktum som ødelgger, derfor laster jeg den inn i excel og endrer manuelt fra ".pred" til "tema", skrev tema feil, så det ble "team"
+
+write.xlsx(prediksjon_stor, file = "myworkbook.xlsx",
+           sheetName = "prediksjon_stor3", append = FALSE)
+
+#Temabytt <- read_excel("Documents/STV - 2022/Temabytt.xlsx")
+Temabytt <- read_excel("~/Desktop/Temabytt.xlsx")
+```
+
+```{r, include=TRUE}
+#Lager ett datasett med kun tema EU
+PrediksjonEU <- Temabytt %>%
+  select(sendt_date,title,team) %>%
+  filter(team == "Eu")
+#Lager ett datasett med både EU og ikke-EU
+PrediksjonALT <- Temabytt %>%
+  select(sendt_date,title,team)
+#Leger ett datasett med kun ikke-EU
+PrediksjonIKKE <- Temabytt %>%
+  select(sendt_date,title,team) %>%
+  filter(team == "ikke-Eu")
+
+
+#sentimentanalyse med både Eu og ikke-Eu
+Stor_tokens <- PrediksjonALT %>% 
+  unnest_tokens(output = token,
+                input = title) 
+
+Stor_corpus <- corpus(PrediksjonALT, docid_field = "sendt_date", text_field = "title")
+
+Stor_corpus_tokens <- tokens(Stor_corpus,
+                             remove_numbers = TRUE,
+                             remove_punct = TRUE,
+                             remove_symbols = TRUE,
+                             remove_separators = TRUE,
+                             remove_url = TRUE,
+                             verbose = TRUE)
+
+Stor_df <- as.data.frame(do.call(rbind, Stor_tokens))
+
+Stor_tokens$pos_sent <- ifelse(Stor_tokens$token %in% nor_fullform_sent$positive, 1, 0)
+
+Stor_tokens$neg_sent <- ifelse(Stor_tokens$token %in% nor_fullform_sent$negative, 1, 0)
+
+table(Stor_tokens$pos_sent, 
+      Stor_tokens$neg_sent, 
+      dnn = c("positiv", "negativ"))
+
+
+
+Stor_sentALT <- Stor_tokens %>% 
+  group_by(sendt_date) %>% 
+  summarize(pos_sent = mean(pos_sent),
+            neg_sent = mean(neg_sent)) %>% 
+  mutate(sent = pos_sent - neg_sent)
+
+
+Stor_sentALT %>% 
+  mutate(neg_sent = neg_sent * -1) %>% 
+  ggplot(., aes(x = str_c(sprintf("%02d", 1:10),
+                          ". ",
+                          str_sub(sendt_date, 1, 7),
+                          "[...]"))) +
+  geom_point(aes(y = sent, color = "Snitt")) +
+  geom_linerange(aes(ymin = neg_sent, ymax = pos_sent), color = "gray40") +
+  scale_color_manual(values = c("red", "cyan", "gray70")) +
+  labs(x = NULL, y = "All Storting Sentiment", color = NULL) +
+  ggdark::dark_theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .25, hjust = 0))
+
+Stor_sentALT %>% 
+  mutate(neg_sent = neg_sent * -1) %>% 
+  ggplot(., aes(x = str_c(sprintf("%02d", 1:10),
+                          ". ",
+                          str_sub(sendt_date, 1, 7),
+                          "[...]"))) +
+  geom_point(aes(y = neg_sent, color = "Snitt")) +
+  geom_linerange(aes(ymin = neg_sent, ymax = neg_sent), color = "gray40") +
+  scale_color_manual(values = c("red", "cyan", "gray70")) +
+  labs(x = NULL, y = "All Storting Sentiment", color = NULL) +
+  ggdark::dark_theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .25, hjust = 0))
+
+
+#sentimentanalyse med bare EU 
+
+
+Stor_tokensEU <- PrediksjonEU %>% 
+  unnest_tokens(output = token,
+                input = title) 
+
+Stor_corpusEU <- corpus(PrediksjonEU, docid_field = "sendt_date", text_field = "title")
+
+Stor_corpus_tokensEU <- tokens(Stor_corpusEU,
+                             remove_numbers = TRUE,
+                             remove_punct = TRUE,
+                             remove_symbols = TRUE,
+                             remove_separators = TRUE,
+                             remove_url = TRUE,
+                             verbose = TRUE)
+
+Stor_df <- as.data.frame(do.call(rbind, Stor_tokensEU))
+
+Stor_tokensEU$pos_sent <- ifelse(Stor_tokensEU$token %in% nor_fullform_sent$positive, 1, 0)
+
+Stor_tokensEU$neg_sent <- ifelse(Stor_tokensEU$token %in% nor_fullform_sent$negative, 1, 0)
+
+table(Stor_tokensEU$pos_sent, 
+      Stor_tokensEU$neg_sent, 
+      dnn = c("positiv", "negativ"))
+
+Stor_sentEU <- Stor_tokensEU %>% 
+  group_by(sendt_date) %>% 
+  summarize(pos_sent = mean(pos_sent),
+            neg_sent = mean(neg_sent)) %>% 
+  mutate(sent = pos_sent - neg_sent)
+
+
+Stor_sentEU %>% 
+  mutate(neg_sent = neg_sent * -1) %>% 
+  ggplot(., aes(x = str_c(sprintf("%02d", 1:10),
+                          ". ",
+                          str_sub(sendt_date, 1, 7),
+                          "[...]"))) +
+  geom_point(aes(y = sent, color = "Snitt")) +
+  geom_linerange(aes(ymin = neg_sent, ymax = pos_sent), color = "gray40") +
+  scale_color_manual(values = c("red", "cyan", "gray70")) +
+  labs(x = NULL, y = "EU Storting Sentiment", color = NULL) +
+  ggdark::dark_theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .25, hjust = 0))
+
+Stor_sentEU %>% 
+  mutate(neg_sent = neg_sent * -1) %>% 
+  ggplot(., aes(x = str_c(sprintf("%02d", 1:10),
+                          ". ",
+                          str_sub(sendt_date, 1, 7),
+                          "[...]"))) +
+  geom_point(aes(y = neg_sent, color = "Snitt")) +
+  geom_linerange(aes(ymin = neg_sent, ymax = neg_sent), color = "gray40") +
+  scale_color_manual(values = c("red", "cyan", "gray70")) +
+  labs(x = NULL, y = "Negativt EU Sentiment", color = NULL) +
+  ggdark::dark_theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .25, hjust = 0))
+
+
+
+Stor_sentEU %>% 
+  mutate(neg_sent = neg_sent * -1) %>% 
+  ggplot(., aes(x = str_c(sprintf("%02d", 1:10),
+                          ". ",
+                          str_sub(sendt_date, 1, 7),
+                          "[...]"))) +
+  geom_point(aes(y = pos_sent, color = "Snitt")) +
+  geom_linerange(aes(ymin = pos_sent, ymax = pos_sent), color = "gray40") +
+  scale_color_manual(values = c("red", "cyan", "gray70")) +
+  labs(x = NULL, y = "Positivt EU Sentiment", color = NULL) +
+  ggdark::dark_theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .25, hjust = 0))
+
+#Sentimentanalyse med bare ikke-EU
+
+Stor_tokensIKKE <- PrediksjonIKKE %>% 
+  unnest_tokens(output = token,
+                input = title) 
+
+Stor_corpusIKKE <- corpus(PrediksjonIKKE, docid_field = "sendt_date", text_field = "title")
+
+Stor_corpus_tokensIKKE <- tokens(Stor_corpusIKKE,
+                               remove_numbers = TRUE,
+                               remove_punct = TRUE,
+                               remove_symbols = TRUE,
+                               remove_separators = TRUE,
+                               remove_url = TRUE,
+                               verbose = TRUE)
+
+Stor_df <- as.data.frame(do.call(rbind, Stor_tokensIKKE))
+
+Stor_tokensIKKE$pos_sent <- ifelse(Stor_tokensIKKE$token %in% nor_fullform_sent$positive, 1, 0)
+
+Stor_tokensIKKE$neg_sent <- ifelse(Stor_tokensIKKE$token %in% nor_fullform_sent$negative, 1, 0)
+
+table(Stor_tokensIKKE$pos_sent, 
+      Stor_tokensIKKE$neg_sent, 
+      dnn = c("positiv", "negativ"))
+
+Stor_sentIKKE <- Stor_tokensIKKE %>% 
+  group_by(sendt_date) %>% 
+  summarize(pos_sent = mean(pos_sent),
+            neg_sent = mean(neg_sent)) %>% 
+  mutate(sent = pos_sent - neg_sent)
+
+Stor_sentIKKE %>% 
+  mutate(neg_sent = neg_sent * -1) %>% 
+  ggplot(., aes(x = str_c(sprintf("%02d", 1:10),
+                          ". ",
+                          str_sub(sendt_date, 1, 7),
+                          "[...]"))) +
+  geom_point(aes(y = sent, color = "Snitt")) +
+  geom_linerange(aes(ymin = neg_sent, ymax = pos_sent), color = "gray40") +
+  scale_color_manual(values = c("red", "cyan", "gray70")) +
+  labs(x = NULL, y = "Ikke-EU Storting Sentiment", color = NULL) +
+  ggdark::dark_theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .25, hjust = 0))
+
+
+```
