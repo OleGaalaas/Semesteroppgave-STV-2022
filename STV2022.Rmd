@@ -8,6 +8,7 @@ output:
     df_print: paged
   word_document: default
 ---
+
 ```{r setup, include=TRUE}
 #Laster inn pakker jeg bruker i oppgaven
 library(tidymodels)
@@ -49,7 +50,6 @@ ggplot(data = Pris) +
   labs(y = "Kvartal",
        x = "Strømpris pris kroner")
 ```
-
 
 ```{r, include=TRUE}
 #Henter Skriftilige spørsmål fra Stortinget 
@@ -120,7 +120,6 @@ Stor_tokens1 %>%
 
 
 ```
-
 
 ```{r, include=TRUE}
 #lager et nyttdatasett uten NA
